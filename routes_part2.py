@@ -137,6 +137,23 @@ def get_section(section_id: int):
     finally:
         conn.close()
 
+@part2.delete("/api/v1/sections/<int:section_id>")
+def delete_section(section_id: int):
+    try:
+        conn = get_connection()
+        section = conn.execute("SELECT id FROM sections WHERE id = ?", (section_id,)).fetchone()
+        if not section:
+            return jsonify({"success": False, "error": "Section not found"}), 404
+        
+        # ON DELETE CASCADE on groups table should handle group deletion
+        conn.execute("DELETE FROM sections WHERE id = ?", (section_id,))
+        conn.commit()
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
 
 @part2.post("/api/v1/sections/<int:section_id>/import")
 def import_csv(section_id: int):
@@ -297,6 +314,127 @@ def get_group(group_id: int):
             "group": dict(group),
             "members": [dict(m) for m in members]
         }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@part2.post("/api/v1/sections/<int:section_id>/groups")
+def create_group(section_id: int):
+    """Create a new group inside a section."""
+    payload = get_payload()
+    group_number = payload.get("group_number")
+    group_name   = normalize_text(payload.get("group_name") or "")
+    try:
+        group_number = int(group_number)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "group_number must be an integer"}), 400
+    try:
+        conn = get_connection()
+        section = conn.execute("SELECT id FROM sections WHERE id = ?", (section_id,)).fetchone()
+        if not section:
+            return jsonify({"success": False, "error": "Section not found"}), 404
+        existing = conn.execute(
+            "SELECT id FROM groups WHERE section_id = ? AND group_number = ?",
+            (section_id, group_number)
+        ).fetchone()
+        if existing:
+            return jsonify({"success": False, "error": f"Group {group_number} already exists in this section"}), 409
+        cur = conn.execute(
+            "INSERT INTO groups (section_id, group_number, group_name) VALUES (?, ?, ?)",
+            (section_id, group_number, group_name or f"Group {group_number}")
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM groups WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return jsonify({"success": True, "group": dict(row)}), 201
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@part2.delete("/api/v1/groups/<int:group_id>")
+def delete_group(group_id: int):
+    """Delete a group (and cascade-removes all its students)."""
+    try:
+        conn = get_connection()
+        group = conn.execute("SELECT id, section_id FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not group:
+            return jsonify({"success": False, "error": "Group not found"}), 404
+        # Remove students' user accounts first
+        student_ids = conn.execute("SELECT user_id FROM students WHERE group_id = ?", (group_id,)).fetchall()
+        for s in student_ids:
+            conn.execute("DELETE FROM users WHERE id = ?", (s["user_id"],))
+        conn.execute("DELETE FROM students WHERE group_id = ?", (group_id,))
+        conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+        conn.commit()
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@part2.post("/api/v1/groups/<int:group_id>/students")
+def add_student_to_group(group_id: int):
+    """Add a single student manually to a group."""
+    payload = get_payload()
+    stud_number = normalize_text(payload.get("student_number") or payload.get("stud_number") or "")
+    surname     = normalize_text(payload.get("surname") or "")
+    first_name  = normalize_text(payload.get("first_name") or "")
+    middle_initial = normalize_text(payload.get("middle_initial") or "")
+    email       = normalize_text(payload.get("email") or "")
+
+    if not stud_number or not surname or not first_name or not email:
+        return jsonify({"success": False, "error": "student_number, surname, first_name, and email are required"}), 400
+    try:
+        conn = get_connection()
+        group = conn.execute("SELECT id FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not group:
+            return jsonify({"success": False, "error": "Group not found"}), 404
+        if conn.execute("SELECT 1 FROM students WHERE stud_number = ?", (stud_number,)).fetchone():
+            return jsonify({"success": False, "error": f"Student number {stud_number} already exists"}), 409
+        if conn.execute("SELECT 1 FROM students WHERE email = ?", (email,)).fetchone():
+            return jsonify({"success": False, "error": f"Email {email} already exists"}), 409
+
+        temp_pw = generate_temp_password()
+        hashed  = hash_password(temp_pw)
+        mi_dot  = f"{middle_initial}. " if middle_initial else ""
+        full_name = f"{first_name} {mi_dot}{surname}".strip()
+
+        user_cur = conn.execute(
+            "INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email, password, is_first_login) VALUES (0,?,?,?,?,?,?,1)",
+            (stud_number, first_name, surname, full_name, email, hashed)
+        )
+        user_id = user_cur.lastrowid
+        cur = conn.execute(
+            "INSERT INTO students (user_id, group_id, stud_number, surname, first_name, middle_initial, email, temp_password) VALUES (?,?,?,?,?,?,?,?)",
+            (user_id, group_id, stud_number, surname, first_name, middle_initial or None, email, temp_pw)
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM students WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return jsonify({"success": True, "student": dict(row), "temp_password": temp_pw}), 201
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@part2.delete("/api/v1/students/<int:student_id>")
+def delete_student(student_id: int):
+    """Remove a student from the system (also deletes their user account)."""
+    try:
+        conn = get_connection()
+        student = conn.execute("SELECT user_id FROM students WHERE id = ?", (student_id,)).fetchone()
+        if not student:
+            return jsonify({"success": False, "error": "Student not found"}), 404
+        conn.execute("DELETE FROM record WHERE student_id = ?", (student_id,))
+        conn.execute("DELETE FROM students WHERE id = ?", (student_id,))
+        if student["user_id"]:
+            conn.execute("DELETE FROM users WHERE id = ?", (student["user_id"],))
+        conn.commit()
+        return jsonify({"success": True}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
@@ -614,10 +752,76 @@ def student_set_password():
     finally:
         conn.close()
 
+@part2.post("/api/v1/student/login")
+def student_login():
+    """
+    Student email + password login (for already-activated accounts).
+    Mirrors /api/v2/login but scoped to is_teacher = 0.
+    """
+    import secrets as _secrets
+    from datetime import datetime as _dt, timedelta as _td
+
+    payload = get_payload()
+    email = normalize_text(payload.get("email") or "")
+    password = normalize_text(payload.get("password") or "")
+
+    if not email or not password:
+        return jsonify({"success": False, "error": "Email and password are required"}), 400
+
+    try:
+        conn = get_connection()
+
+        student = conn.execute(
+            """
+            SELECT st.id AS student_id, st.first_name, st.surname, st.stud_number,
+                   st.email, st.group_id,
+                   u.id AS user_id, u.password AS hashed_password, u.is_first_login,
+                   g.group_number, g.group_name,
+                   s.name AS section_name, s.id AS section_id
+            FROM students st
+            JOIN users u ON LOWER(u.email) = LOWER(st.email)
+            JOIN groups g ON g.id = st.group_id
+            JOIN sections s ON s.id = g.section_id
+            WHERE LOWER(st.email) = LOWER(?)
+            """,
+            (email,)
+        ).fetchone()
+
+        if not student:
+            return jsonify({"success": False, "error": "Invalid email or password"}), 401
+
+        if student["is_first_login"]:
+            return jsonify({"success": False, "error": "Account not yet activated. Please use the temporary code to set your password first."}), 403
+
+        if not bcrypt.checkpw(password.encode("utf-8"), student["hashed_password"].encode("utf-8")):
+            return jsonify({"success": False, "error": "Invalid email or password"}), 401
+
+        return jsonify({
+            "success": True,
+            "student": {
+                "id": student["student_id"],
+                "user_id": student["user_id"],
+                "email": student["email"],
+                "first_name": student["first_name"],
+                "surname": student["surname"],
+                "stud_number": student["stud_number"],
+                "group_id": student["group_id"],
+                "group_number": student["group_number"],
+                "group_name": student["group_name"],
+                "section_name": student["section_name"],
+                "section_id": student["section_id"],
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
 
 @part2.get("/api/v1/students/<int:student_id>/me")
 def get_student_me(student_id: int):
     """Get full student data + records for the student's own view."""
+
     try:
         conn = get_connection()
         student = conn.execute(
