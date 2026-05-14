@@ -221,37 +221,48 @@ def import_csv(section_id: int):
 
             group_id = group_cache[group_number]
 
-            if conn.execute("SELECT 1 FROM students WHERE stud_number = ?", (stud_number,)).fetchone():
-                errors.append(f"Row {i}: student number {stud_number} already exists — skipped")
+            if conn.execute("SELECT 1 FROM students WHERE stud_number = ? AND group_id = ?", (stud_number, group_id)).fetchone():
+                errors.append(f"Row {i}: student number {stud_number} already exists in this group — skipped")
                 continue
-            if conn.execute("SELECT 1 FROM students WHERE email = ?", (email,)).fetchone():
-                errors.append(f"Row {i}: email {email} already exists — skipped")
+            if conn.execute("SELECT 1 FROM students WHERE email = ? AND group_id = ?", (email, group_id)).fetchone():
+                errors.append(f"Row {i}: email {email} already exists in this group — skipped")
                 continue
 
-            temp_pw = generate_temp_password()
-            hashed = hash_password(temp_pw)
-            mi_dot = f"{middle_initial}. " if middle_initial else ""
-            full_name_val = f"{first_name} {mi_dot}{surname}".strip()
+            existing_user = conn.execute("SELECT id, is_first_login FROM users WHERE stud_id = ?", (stud_number,)).fetchone()
+            if existing_user:
+                user_id = existing_user["id"]
+                is_first_login = existing_user["is_first_login"]
+                if is_first_login:
+                    existing_student = conn.execute("SELECT temp_password FROM students WHERE user_id = ? AND temp_password IS NOT NULL", (user_id,)).fetchone()
+                    temp_pw = existing_student["temp_password"] if existing_student else generate_temp_password()
+                else:
+                    temp_pw = None
+            else:
+                temp_pw = generate_temp_password()
+                hashed = hash_password(temp_pw)
+                mi_dot = f"{middle_initial}. " if middle_initial else ""
+                full_name_val = f"{first_name} {mi_dot}{surname}".strip()
 
-            user_cur = conn.execute(
-                """
-                INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email,
-                                   password, is_first_login)
-                VALUES (0, ?, ?, ?, ?, ?, ?, 1)
-                """,
-                (stud_number, first_name, surname, full_name_val, email, hashed)
-            )
-            user_id = user_cur.lastrowid
+                user_cur = conn.execute(
+                    """
+                    INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email,
+                                       password, is_first_login)
+                    VALUES (0, ?, ?, ?, ?, ?, ?, 1)
+                    """,
+                    (stud_number, first_name, surname, full_name_val, email, hashed)
+                )
+                user_id = user_cur.lastrowid
+                is_first_login = 1
 
             conn.execute(
                 """
                 INSERT INTO students
                     (user_id, group_id, stud_number, surname, first_name,
-                     middle_initial, email, temp_password)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     middle_initial, email, temp_password, is_first_login)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (user_id, group_id, stud_number, surname, first_name,
-                 middle_initial or None, email, temp_pw)
+                 middle_initial or None, email, temp_pw, is_first_login)
             )
 
             imported.append({
@@ -393,24 +404,36 @@ def add_student_to_group(group_id: int):
         group = conn.execute("SELECT id FROM groups WHERE id = ?", (group_id,)).fetchone()
         if not group:
             return jsonify({"success": False, "error": "Group not found"}), 404
-        if conn.execute("SELECT 1 FROM students WHERE stud_number = ?", (stud_number,)).fetchone():
-            return jsonify({"success": False, "error": f"Student number {stud_number} already exists"}), 409
-        if conn.execute("SELECT 1 FROM students WHERE email = ?", (email,)).fetchone():
-            return jsonify({"success": False, "error": f"Email {email} already exists"}), 409
+        if conn.execute("SELECT 1 FROM students WHERE stud_number = ? AND group_id = ?", (stud_number, group_id)).fetchone():
+            return jsonify({"success": False, "error": f"Student number {stud_number} already exists in this group"}), 409
+        if conn.execute("SELECT 1 FROM students WHERE email = ? AND group_id = ?", (email, group_id)).fetchone():
+            return jsonify({"success": False, "error": f"Email {email} already exists in this group"}), 409
 
-        temp_pw = generate_temp_password()
-        hashed  = hash_password(temp_pw)
-        mi_dot  = f"{middle_initial}. " if middle_initial else ""
-        full_name = f"{first_name} {mi_dot}{surname}".strip()
+        existing_user = conn.execute("SELECT id, is_first_login FROM users WHERE stud_id = ?", (stud_number,)).fetchone()
+        if existing_user:
+            user_id = existing_user["id"]
+            is_first_login = existing_user["is_first_login"]
+            if is_first_login:
+                existing_student = conn.execute("SELECT temp_password FROM students WHERE user_id = ? AND temp_password IS NOT NULL", (user_id,)).fetchone()
+                temp_pw = existing_student["temp_password"] if existing_student else generate_temp_password()
+            else:
+                temp_pw = None
+        else:
+            temp_pw = generate_temp_password()
+            hashed  = hash_password(temp_pw)
+            mi_dot  = f"{middle_initial}. " if middle_initial else ""
+            full_name = f"{first_name} {mi_dot}{surname}".strip()
 
-        user_cur = conn.execute(
-            "INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email, password, is_first_login) VALUES (0,?,?,?,?,?,?,1)",
-            (stud_number, first_name, surname, full_name, email, hashed)
-        )
-        user_id = user_cur.lastrowid
+            user_cur = conn.execute(
+                "INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email, password, is_first_login) VALUES (0,?,?,?,?,?,?,1)",
+                (stud_number, first_name, surname, full_name, email, hashed)
+            )
+            user_id = user_cur.lastrowid
+            is_first_login = 1
+            
         cur = conn.execute(
-            "INSERT INTO students (user_id, group_id, stud_number, surname, first_name, middle_initial, email, temp_password) VALUES (?,?,?,?,?,?,?,?)",
-            (user_id, group_id, stud_number, surname, first_name, middle_initial or None, email, temp_pw)
+            "INSERT INTO students (user_id, group_id, stud_number, surname, first_name, middle_initial, email, temp_password, is_first_login) VALUES (?,?,?,?,?,?,?,?,?)",
+            (user_id, group_id, stud_number, surname, first_name, middle_initial or None, email, temp_pw, is_first_login)
         )
         conn.commit()
         row = conn.execute("SELECT * FROM students WHERE id = ?", (cur.lastrowid,)).fetchone()
@@ -613,8 +636,7 @@ def student_request_temp():
         ).fetchone()
 
         if not student:
-            # Generic message to avoid enumeration
-            return jsonify({"success": True, "message": "If this email is registered, a code has been sent."}), 200
+            return jsonify({"success": False, "error": "Email not found in our records. Please contact your teacher to ensure you are registered."}), 404
 
         if not student["is_first_login"]:
             return jsonify({"success": False, "error": "Account already activated. Please log in normally."}), 400
@@ -714,8 +736,8 @@ def student_set_password():
 
         # Update students table
         conn.execute(
-            "UPDATE students SET temp_password = NULL, is_first_login = 0 WHERE id = ?",
-            (student["id"],)
+            "UPDATE students SET temp_password = NULL, is_first_login = 0 WHERE LOWER(email) = LOWER(?)",
+            (email,)
         )
 
         # Update users table (the auth account)
@@ -796,7 +818,7 @@ def student_login():
         if not bcrypt.checkpw(password.encode("utf-8"), student["hashed_password"].encode("utf-8")):
             return jsonify({"success": False, "error": "Invalid email or password"}), 401
 
-        return jsonify({
+        response_data = {
             "success": True,
             "student": {
                 "id": student["student_id"],
@@ -811,7 +833,19 @@ def student_login():
                 "section_name": student["section_name"],
                 "section_id": student["section_id"],
             }
-        }), 200
+        }
+
+        if str(payload.get("remember")).lower() in ["1", "true", "on", "yes"]:
+            token = _secrets.token_hex(32)
+            expires_at = _dt.now() + _td(days=30)
+            conn.execute(
+                "INSERT INTO user_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
+                (student["user_id"], token, expires_at.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.commit()
+            response_data["token"] = token
+
+        return jsonify(response_data), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
@@ -851,6 +885,80 @@ def get_student_me(student_id: int):
             "success": True,
             "student": dict(student),
             "records": [dict(r) for r in records],
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+@part2.get("/api/v1/users/<int:user_id>/student_dashboard")
+def get_user_student_dashboard(user_id: int):
+    """Get full student data + records + enrollments for the student's own view."""
+    enrollment_id = request.args.get("enrollment_id", type=int)
+    
+    try:
+        conn = get_connection()
+        
+        # 1. Fetch all enrollments for this user
+        enrollments = conn.execute(
+            """
+            SELECT st.id AS student_id, st.stud_number,
+                   g.group_number, g.group_name,
+                   s.name AS section_name, s.id AS section_id,
+                   t.full_name AS teacher_name
+            FROM students st
+            JOIN groups g ON g.id = st.group_id
+            JOIN sections s ON s.id = g.section_id
+            JOIN users t ON t.id = s.teacher_id
+            WHERE st.user_id = ?
+            ORDER BY s.created_at DESC
+            """,
+            (user_id,)
+        ).fetchall()
+        
+        enrollments_list = [dict(e) for e in enrollments]
+        if not enrollments_list:
+            return jsonify({"success": False, "error": "No enrollments found for this user"}), 404
+            
+        # 2. Determine target student_id (enrollment_id)
+        target_student_id = enrollment_id
+        if not target_student_id:
+            target_student_id = enrollments_list[0]["student_id"]
+        else:
+            # Validate that the requested enrollment belongs to this user
+            if not any(e["student_id"] == target_student_id for e in enrollments_list):
+                return jsonify({"success": False, "error": "Unauthorized enrollment ID"}), 403
+
+        # 3. Fetch specific student details
+        student = conn.execute(
+            """
+            SELECT st.*, g.group_number, g.group_name,
+                   s.name AS section_name, s.id AS section_id,
+                   t.full_name AS teacher_name
+            FROM students st
+            JOIN groups g ON g.id = st.group_id
+            JOIN sections s ON s.id = g.section_id
+            JOIN users t ON t.id = s.teacher_id
+            WHERE st.id = ?
+            """,
+            (target_student_id,)
+        ).fetchone()
+        
+        # 4. Fetch records for this student
+        records = conn.execute(
+            """
+            SELECT id, date, type_of_undertaking, total_score, score, remarks, created_at
+            FROM record WHERE student_id = ?
+            ORDER BY date DESC, created_at DESC
+            """,
+            (target_student_id,)
+        ).fetchall()
+
+        return jsonify({
+            "success": True,
+            "student": dict(student),
+            "records": [dict(r) for r in records],
+            "enrollments": enrollments_list
         }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
