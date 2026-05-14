@@ -339,8 +339,13 @@ def create_group(section_id: int):
     group_name   = normalize_text(payload.get("group_name") or "")
     try:
         group_number = int(group_number)
+        if group_number < 1 or group_number > 255:
+            return jsonify({"success": False, "error": "group_number must be between 1 and 255"}), 400
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "group_number must be an integer"}), 400
+
+    if group_name and len(group_name) > 25:
+        return jsonify({"success": False, "error": "group_name exceeds 25 characters"}), 400
     try:
         conn = get_connection()
         section = conn.execute("SELECT id FROM sections WHERE id = ?", (section_id,)).fetchone()

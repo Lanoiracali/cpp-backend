@@ -347,15 +347,24 @@ def verify_token():
             connection.commit()
             return jsonify({"success": False, "error": "Token expired"}), 401
 
-        user_row = connection.execute(
-            "SELECT * FROM users WHERE id = ?",
-            (token_row["user_id"],)
-        ).fetchone()
+        # Join with students to get student_id if they are a student
+        query = """
+            SELECT u.*, st.id AS student_id
+            FROM users u
+            LEFT JOIN students st ON LOWER(st.email) = LOWER(u.email)
+            WHERE u.id = ?
+        """
+        user_row = connection.execute(query, (token_row["user_id"],)).fetchone()
 
         if not user_row:
             return jsonify({"success": False, "error": "User not found"}), 404
 
-        return jsonify({"success": True, "user": build_user_response(user_row)}), 200
+        user_data = build_user_response(user_row)
+        if user_row["student_id"]:
+            user_data["student_id"] = user_row["student_id"]
+            user_data["studentId"] = user_row["student_id"]
+
+        return jsonify({"success": True, "user": user_data}), 200
     except Exception as error:
         return jsonify({"success": False, "error": "Verification failed", "details": str(error)}), 500
     finally:
