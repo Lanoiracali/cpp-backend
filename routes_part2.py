@@ -153,6 +153,12 @@ def create_section():
 
     try:
         conn = get_connection()
+        existing = conn.execute(
+            "SELECT id FROM sections WHERE teacher_id = ? AND LOWER(name) = LOWER(?)",
+            (int(teacher_id), name)
+        ).fetchone()
+        if existing:
+            return jsonify({"success": False, "error": f"Section '{name}' already exists."}), 409
         cur = conn.execute(
             "INSERT INTO sections (teacher_id, name, school_year, semester) VALUES (?, ?, ?, ?)",
             (int(teacher_id), name, school_year or None, semester or None)
