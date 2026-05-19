@@ -42,6 +42,13 @@ class DBConn:
             if sql_pg.strip().lower().startswith("insert") and "returning" not in sql_pg.lower():
                 sql_pg = sql_pg + " RETURNING id"
 
+            # Ensure Python bools stay as booleans (not int 0/1) for Postgres BOOLEAN columns
+            if params:
+                params = tuple(
+                    bool(p) if isinstance(p, bool) else p
+                    for p in params
+                )
+
             cur.execute(sql_pg, params)
 
             # If we added RETURNING, fetch the id so callers can use cur.lastrowid like sqlite

@@ -166,6 +166,40 @@ def create_section():
         conn.close()
 
 
+@part2.post("/api/v2/sections")
+def create_section_v2():
+    payload = get_payload()
+    teacher_id = normalize_text(payload.get("teacher_id"))
+    name = normalize_text(payload.get("name"))
+    school_year = normalize_text(payload.get("school_year") or "")
+    semester = normalize_text(payload.get("semester") or "")
+
+    if not teacher_id or not name:
+        return jsonify({"success": False, "error": "teacher_id and name are required"}), 400
+
+    try:
+        conn = get_connection()
+        # Check if the section already exists for this teacher (case-insensitive)
+        existing = conn.execute(
+            "SELECT id FROM sections WHERE teacher_id = ? AND LOWER(name) = LOWER(?)",
+            (int(teacher_id), name)
+        ).fetchone()
+        if existing:
+            return jsonify({"success": False, "error": f"Section '{name}' already exists."}), 400
+
+        cur = conn.execute(
+            "INSERT INTO sections (teacher_id, name, school_year, semester) VALUES (?, ?, ?, ?)",
+            (int(teacher_id), name, school_year or None, semester or None)
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM sections WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return jsonify({"success": True, "section": dict(row)}), 201
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 @part2.get("/api/v1/sections/<int:section_id>")
 def get_section(section_id: int):
     try:
@@ -248,7 +282,7 @@ def import_csv(section_id: int):
             stud_number = col(row, "student_number", "stud_number", "student_no")
             surname = col(row, "surname", "last_name")
             first_name = col(row, "first_name", "firstname")
-            middle_initial = col(row, "middle_initial", "mi")
+            middle_initial = col(row, "middle_initial", "mi")[:2]  # max 2 chars
             email = col(row, "email")
             group_number_raw = col(row, "group_number", "group_no", "group_#")
             group_name = col(row, "group_name", "groupname")
@@ -289,7 +323,7 @@ def import_csv(section_id: int):
             existing_user = conn.execute("SELECT id, is_first_login FROM users WHERE stud_id = ?", (stud_number,)).fetchone()
             if existing_user:
                 user_id = existing_user["id"]
-                is_first_login = existing_user["is_first_login"]
+                is_first_login = is_first_login_flag(existing_user["is_first_login"])
                 if is_first_login:
                     existing_student = conn.execute("SELECT temp_password FROM students WHERE user_id = ? AND temp_password IS NOT NULL", (user_id,)).fetchone()
                     temp_pw = existing_student["temp_password"] if existing_student else generate_temp_password()
@@ -459,11 +493,13 @@ def add_student_to_group(group_id: int):
     stud_number = normalize_text(payload.get("student_number") or payload.get("stud_number") or "")
     surname     = normalize_text(payload.get("surname") or "")
     first_name  = normalize_text(payload.get("first_name") or "")
-    middle_initial = normalize_text(payload.get("middle_initial") or "")
+    middle_initial = normalize_text(payload.get("middle_initial") or "")[:2]  # max 2 chars
     email       = normalize_text(payload.get("email") or "")
 
     if not stud_number or not surname or not first_name or not email:
         return jsonify({"success": False, "error": "student_number, surname, first_name, and email are required"}), 400
+    if middle_initial and len(middle_initial) > 2:
+        return jsonify({"success": False, "error": "Middle initial must be at most 2 characters"}), 400
     try:
         conn = get_connection()
         group = conn.execute("SELECT id FROM groups WHERE id = ?", (group_id,)).fetchone()
@@ -477,7 +513,7 @@ def add_student_to_group(group_id: int):
         existing_user = conn.execute("SELECT id, is_first_login FROM users WHERE stud_id = ?", (stud_number,)).fetchone()
         if existing_user:
             user_id = existing_user["id"]
-            is_first_login = existing_user["is_first_login"]
+            is_first_login = is_first_login_flag(existing_user["is_first_login"])
             if is_first_login:
                 existing_student = conn.execute("SELECT temp_password FROM students WHERE user_id = ? AND temp_password IS NOT NULL", (user_id,)).fetchone()
                 temp_pw = existing_student["temp_password"] if existing_student else generate_temp_password()
@@ -494,7 +530,7 @@ def add_student_to_group(group_id: int):
                 (False, stud_number, first_name, surname, full_name, email, hashed, True)
             )
             user_id = user_cur.lastrowid
-            is_first_login = 1
+            is_first_login = True
             
         cur = conn.execute(
             "INSERT INTO students (user_id, group_id, stud_number, surname, first_name, middle_initial, email, temp_password, is_first_login) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -595,6 +631,11 @@ def add_student_record(student_id: int):
     except (ValueError, TypeError):
         return jsonify({"success": False, "error": "score and total_score must be numbers"}), 400
 
+    if score < 0:
+        return jsonify({"success": False, "error": "Score cannot be negative"}), 400
+    if total_score is not None and total_score < 0:
+        return jsonify({"success": False, "error": "Total score cannot be negative"}), 400
+
     try:
         conn = get_connection()
         student = conn.execute("SELECT stud_number FROM students WHERE id = ?", (student_id,)).fetchone()
@@ -637,6 +678,11 @@ def update_record_endpoint(record_id: int):
         score = float(score_raw)
     except (ValueError, TypeError):
         return jsonify({"success": False, "error": "score must be a number"}), 400
+
+    if score < 0:
+        return jsonify({"success": False, "error": "Score cannot be negative"}), 400
+    if total_score is not None and total_score < 0:
+        return jsonify({"success": False, "error": "Total score cannot be negative"}), 400
 
     try:
         conn = get_connection()
