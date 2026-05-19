@@ -636,7 +636,17 @@ def delete_account():
 
         # Delete records created by this user (if teacher)
         if user["is_teacher"]:
-            connection.execute("DELETE FROM record WHERE created_by = ?", (user_id,))
+            connection.execute(
+                """
+                DELETE FROM record WHERE student_id IN (
+                    SELECT s.id FROM students s
+                    JOIN groups g ON s.group_id = g.id
+                    JOIN sections sec ON g.section_id = sec.id
+                    WHERE sec.teacher_id = ?
+                )
+                """,
+                (user_id,)
+            )
 
         # Delete user
         connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
@@ -751,7 +761,17 @@ def delete_account_v2():
 
         if is_teacher:
             # Delete records created by this teacher
-            connection.execute("DELETE FROM record WHERE created_by = ?", (user_id,))
+            connection.execute(
+                """
+                DELETE FROM record WHERE student_id IN (
+                    SELECT s.id FROM students s
+                    JOIN groups g ON s.group_id = g.id
+                    JOIN sections sec ON g.section_id = sec.id
+                    WHERE sec.teacher_id = ?
+                )
+                """,
+                (user_id,)
+            )
         else:
             # It's a student user. Let's find their student_id
             student_row = connection.execute("SELECT id FROM students WHERE user_id = ?", (user_id,)).fetchone()
