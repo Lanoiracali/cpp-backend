@@ -12,22 +12,15 @@ from flask import Flask, jsonify, request
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR.parent / "cpp-backend" / "cppstudrecord_db.sqlite"
-DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", DEFAULT_DB_PATH))
 
 app = Flask(__name__)
 
 from routes_part2 import part2
 app.register_blueprint(part2)
 
-
-def get_connection() -> sqlite3.Connection:
-    if not DATABASE_PATH.exists():
-        raise FileNotFoundError(f"Database file not found at {DATABASE_PATH}")
-
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+# Use the adapter which will pick Postgres when `DATABASE_URL` is set,
+# otherwise fall back to the local sqlite file.
+from db_adapter import get_connection
 
 
 def get_payload() -> dict:
@@ -114,7 +107,23 @@ def build_user_response(user_row) -> dict:
 
 @app.get("/api/v1/health")
 def health_check():
-    return jsonify({"success": True, "status": "ok"})
+    db_status = "unknown"
+    try:
+        connection = get_connection()
+        try:
+            connection.execute("SELECT 1")
+            db_status = connection._mode
+        finally:
+            connection.close()
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "status": "degraded",
+            "database": db_status,
+            "error": str(error),
+        }), 503
+
+    return jsonify({"success": True, "status": "ok", "database": db_status})
 
 
 @app.post("/api/v1/register")
@@ -182,7 +191,7 @@ def register_user():
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                1 if is_teacher else 0,
+                bool(is_teacher),
                 stud_id,
                 first_name,
                 last_name,
@@ -289,17 +298,25 @@ def login_user_v2():
         return jsonify({"success": False, "error": str(error)}), 503
 
     try:
+        # Debug: log the email being searched
+        print(f"[DEBUG] Attempting login with email: {email}")
+        
         user_row = connection.execute(
-            "SELECT * FROM users WHERE email = ? AND is_teacher = 1",
+            "SELECT * FROM users WHERE email = ? AND is_teacher = TRUE",
             (email,)
         ).fetchone()
 
         if not user_row:
+            print(f"[DEBUG] User not found for email: {email}")
             return jsonify({"success": False, "error": "Invalid email or password"}), 401
 
+        print(f"[DEBUG] User found: {user_row.get('id')} - checking password")
+        
         if not check_password(password, user_row["password"]):
+            print(f"[DEBUG] Password check failed for user: {user_row.get('id')}")
             return jsonify({"success": False, "error": "Invalid email or password"}), 401
 
+        print(f"[DEBUG] Login successful for user: {user_row.get('id')}")
         response_data = {"success": True, "user": build_user_response(user_row)}
 
         if str(payload.get("remember")).lower() in ["1", "true", "on", "yes"]:
@@ -314,6 +331,7 @@ def login_user_v2():
 
         return jsonify(response_data), 200
     except Exception as error:
+        print(f"[DEBUG] Login error: {error}")
         return jsonify({"success": False, "error": "Login failed", "details": str(error)}), 500
     finally:
         connection.close()
@@ -398,10 +416,24 @@ def logout_user():
 def get_stats():
     try:
         connection = get_connection()
-        enrolled_row = connection.execute("SELECT COUNT(*) as count FROM users WHERE is_teacher = 0").fetchone()
+        enrolled_row = connection.execute("SELECT COUNT(*) as count FROM users WHERE is_teacher = FALSE").fetchone()
         records_row = connection.execute("SELECT COUNT(*) as count FROM record").fetchone()
-        teachers_row = connection.execute("SELECT COUNT(*) as count FROM users WHERE is_teacher = 1").fetchone()
-        sections_row = connection.execute("SELECT COUNT(DISTINCT section) as count FROM users WHERE is_teacher = 0 AND section IS NOT NULL").fetchone()
+        teachers_row = connection.execute("SELECT COUNT(*) as count FROM users WHERE is_teacher = TRUE").fetchone()
+        # Prefer an explicit sections table if present (accurate count of created sections).
+        user_id_header = request.headers.get('X-User-Id')
+        try:
+            if user_id_header:
+                try:
+                    tid = int(user_id_header)
+                    sections_row = connection.execute("SELECT COUNT(*) as count FROM sections WHERE teacher_id = ?", (tid,)).fetchone()
+                except Exception:
+                    # If conversion fails, fallback to global sections count
+                    sections_row = connection.execute("SELECT COUNT(*) as count FROM sections").fetchone()
+            else:
+                sections_row = connection.execute("SELECT COUNT(*) as count FROM sections").fetchone()
+        except Exception:
+            # Fallback to legacy users.section count when sections table isn't available.
+            sections_row = connection.execute("SELECT COUNT(DISTINCT section) as count FROM users WHERE is_teacher = FALSE AND section IS NOT NULL").fetchone()
 
         return jsonify({
             "success": True,
@@ -412,6 +444,323 @@ def get_stats():
         }), 200
     except Exception as error:
         return jsonify({"success": False, "error": "Failed to fetch stats", "details": str(error)}), 500
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+# ── Profile Management Endpoints ─────────────────────────────────────────────
+def get_user_id_from_request() -> int | None:
+    """Extract user_id from request headers (passed by Node gateway)."""
+    user_id_str = request.headers.get("X-User-Id")
+    if user_id_str:
+        try:
+            return int(user_id_str)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+@app.get("/api/profile")
+def get_profile():
+    """Get the current user's profile."""
+    user_id = get_user_id_from_request()
+    if not user_id:
+        return jsonify({"success": False, "error": "User ID required"}), 401
+
+    try:
+        connection = get_connection()
+        user = connection.execute("SELECT id, stud_id, first_name, last_name, email, is_teacher, profile_pic FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"success": False, "error": "User not found"}), 404
+
+        return jsonify({
+            "success": True,
+            "profile": {
+                "id": user["id"],
+                "stud_id": user["stud_id"],
+                "first_name": user["first_name"],
+                "last_name": user["last_name"],
+                "email": user["email"],
+                "is_teacher": user["is_teacher"],
+                "profile_pic": user["profile_pic"],
+            }
+        }), 200
+    except Exception as error:
+        return jsonify({"success": False, "error": str(error)}), 500
+    finally:
+        connection.close()
+
+
+@app.put("/api/profile")
+def update_profile():
+    """Update user profile (first name, last name)."""
+    user_id = get_user_id_from_request()
+    if not user_id:
+        return jsonify({"success": False, "error": "User ID required"}), 401
+
+    payload = get_payload()
+    first_name = normalize_text(payload.get("first_name"))
+    last_name = normalize_text(payload.get("last_name"))
+
+    if not first_name or not last_name:
+        return jsonify({"success": False, "error": "First name and last name are required"}), 400
+
+    try:
+        connection = get_connection()
+        connection.execute("UPDATE users SET first_name = ?, last_name = ? WHERE id = ?", (first_name, last_name, user_id))
+        connection.commit()
+
+        user = connection.execute("SELECT id, stud_id, first_name, last_name, email, is_teacher, profile_pic FROM users WHERE id = ?", (user_id,)).fetchone()
+        return jsonify({
+            "success": True,
+            "message": "Profile updated successfully",
+            "profile": {
+                "id": user["id"],
+                "stud_id": user["stud_id"],
+                "first_name": user["first_name"],
+                "last_name": user["last_name"],
+                "email": user["email"],
+                "is_teacher": user["is_teacher"],
+                "profile_pic": user["profile_pic"],
+            }
+        }), 200
+    except Exception as error:
+        connection.rollback()
+        return jsonify({"success": False, "error": str(error)}), 500
+    finally:
+        connection.close()
+
+
+@app.post("/api/profile/change-password")
+def change_password():
+    """Change user password."""
+    user_id = get_user_id_from_request()
+    if not user_id:
+        return jsonify({"success": False, "error": "User ID required"}), 401
+
+    payload = get_payload()
+    current_password = normalize_text(payload.get("current_password"))
+    new_password = normalize_text(payload.get("new_password"))
+    confirm_password = normalize_text(payload.get("confirm_password"))
+
+    if not current_password or not new_password or not confirm_password:
+        return jsonify({"success": False, "error": "All password fields are required"}), 400
+
+    if new_password != confirm_password:
+        return jsonify({"success": False, "error": "New passwords do not match"}), 400
+
+    if len(new_password) < 6:
+        return jsonify({"success": False, "error": "Password must be at least 6 characters"}), 400
+
+    try:
+        connection = get_connection()
+        user = connection.execute("SELECT password FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"success": False, "error": "User not found"}), 404
+
+        if not check_password(current_password, user["password"]):
+            return jsonify({"success": False, "error": "Current password is incorrect"}), 401
+
+        hashed_password = hash_password(new_password)
+        connection.execute("UPDATE users SET password = ? WHERE id = ?", (hashed_password, user_id))
+        connection.commit()
+
+        return jsonify({"success": True, "message": "Password changed successfully"}), 200
+    except Exception as error:
+        connection.rollback()
+        return jsonify({"success": False, "error": str(error)}), 500
+    finally:
+        connection.close()
+
+
+@app.post("/api/profile/upload-pic")
+def upload_profile_pic():
+    """Upload profile picture (base64 image)."""
+    user_id = get_user_id_from_request()
+    if not user_id:
+        return jsonify({"success": False, "error": "User ID required"}), 401
+
+    payload = get_payload()
+    profile_pic = normalize_text(payload.get("profile_pic"))
+
+    if not profile_pic:
+        return jsonify({"success": False, "error": "Profile picture data is required"}), 400
+
+    # Validate base64 image (should start with data:image/)
+    if not profile_pic.startswith("data:image/"):
+        return jsonify({"success": False, "error": "Invalid image format"}), 400
+
+    try:
+        connection = get_connection()
+        connection.execute("UPDATE users SET profile_pic = ? WHERE id = ?", (profile_pic, user_id))
+        connection.commit()
+
+        return jsonify({"success": True, "message": "Profile picture updated successfully"}), 200
+    except Exception as error:
+        connection.rollback()
+        return jsonify({"success": False, "error": str(error)}), 500
+    finally:
+        connection.close()
+
+
+@app.delete("/api/profile")
+def delete_account():
+    """Delete user account and all their associated records."""
+    user_id = get_user_id_from_request()
+    if not user_id:
+        return jsonify({"success": False, "error": "User ID required"}), 401
+
+    try:
+        connection = get_connection()
+        user = connection.execute("SELECT id, is_teacher FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"success": False, "error": "User not found"}), 404
+
+        # Delete records created by this user (if teacher)
+        if user["is_teacher"]:
+            connection.execute("DELETE FROM record WHERE created_by = ?", (user_id,))
+
+        # Delete user
+        connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        connection.commit()
+
+        return jsonify({"success": True, "message": "Account deleted successfully"}), 200
+    except Exception as error:
+        connection.rollback()
+        return jsonify({"success": False, "error": str(error)}), 500
+    finally:
+        connection.close()
+
+
+@app.put("/api/v2/profile")
+def update_profile_v2():
+    """Update user profile (first name, last name, email) for v2."""
+    user_id = get_user_id_from_request()
+    if not user_id:
+        return jsonify({"success": False, "error": "User ID required"}), 401
+
+    payload = get_payload()
+    first_name = normalize_text(payload.get("first_name"))
+    last_name = normalize_text(payload.get("last_name"))
+    email = normalize_text(payload.get("email"))
+
+    if not first_name or not last_name or not email:
+        return jsonify({"success": False, "error": "First name, last name, and email are required"}), 400
+
+    try:
+        connection = get_connection()
+        
+        # Check if the email is already registered by another user
+        existing_email_row = connection.execute(
+            "SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ? LIMIT 1",
+            (email, user_id)
+        ).fetchone()
+        
+        if existing_email_row:
+            connection.close()
+            return jsonify({"success": False, "error": "Email is already taken by another account"}), 409
+
+        # Fetch current user to determine role
+        user = connection.execute("SELECT id, is_teacher FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            connection.close()
+            return jsonify({"success": False, "error": "User not found"}), 404
+
+        full_name = f"{first_name} {last_name}".strip()
+        is_teacher = bool(user["is_teacher"])
+
+        # Update users table
+        connection.execute(
+            "UPDATE users SET first_name = ?, last_name = ?, full_name = ?, email = ? WHERE id = ?",
+            (first_name, last_name, full_name, email, user_id)
+        )
+
+        # If user is a student (is_teacher = False), update the students table as well
+        if not is_teacher:
+            connection.execute(
+                "UPDATE students SET first_name = ?, surname = ?, email = ? WHERE user_id = ?",
+                (first_name, last_name, email, user_id)
+            )
+
+        connection.commit()
+
+        updated_user = connection.execute(
+            "SELECT id, stud_id, first_name, last_name, email, is_teacher, profile_pic FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+
+        return jsonify({
+            "success": True,
+            "message": "Profile updated successfully",
+            "profile": {
+                "id": updated_user["id"],
+                "stud_id": updated_user["stud_id"],
+                "first_name": updated_user["first_name"],
+                "last_name": updated_user["last_name"],
+                "email": updated_user["email"],
+                "is_teacher": updated_user["is_teacher"],
+                "profile_pic": updated_user["profile_pic"],
+            }
+        }), 200
+    except Exception as error:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        return jsonify({"success": False, "error": str(error)}), 500
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+@app.delete("/api/v2/profile")
+def delete_account_v2():
+    """Delete user account and all their associated records (v2)."""
+    user_id = get_user_id_from_request()
+    if not user_id:
+        return jsonify({"success": False, "error": "User ID required"}), 401
+
+    try:
+        connection = get_connection()
+        user = connection.execute("SELECT id, is_teacher FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            connection.close()
+            return jsonify({"success": False, "error": "User not found"}), 404
+
+        is_teacher = bool(user["is_teacher"])
+
+        if is_teacher:
+            # Delete records created by this teacher
+            connection.execute("DELETE FROM record WHERE created_by = ?", (user_id,))
+        else:
+            # It's a student user. Let's find their student_id
+            student_row = connection.execute("SELECT id FROM students WHERE user_id = ?", (user_id,)).fetchone()
+            if student_row:
+                student_id = student_row["id"]
+                # Delete records of this student
+                connection.execute("DELETE FROM record WHERE student_id = ?", (student_id,))
+                # Delete student record
+                connection.execute("DELETE FROM students WHERE id = ?", (student_id,))
+
+        # Delete user tokens
+        connection.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+
+        # Delete user
+        connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        connection.commit()
+
+        return jsonify({"success": True, "message": "Account deleted successfully"}), 200
+    except Exception as error:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        return jsonify({"success": False, "error": str(error)}), 500
     finally:
         try:
             connection.close()

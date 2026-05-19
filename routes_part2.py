@@ -19,16 +19,64 @@ part2 = Blueprint("part2", __name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR.parent / "cpp-backend" / "cppstudrecord_db.sqlite"
-DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", DEFAULT_DB_PATH))
+
+# Use the compatibility adapter; it will connect to Postgres when
+# `DATABASE_URL` is provided, otherwise uses the local sqlite file.
+from db_adapter import get_connection
 
 
-def get_connection() -> sqlite3.Connection:
-    if not DATABASE_PATH.exists():
-        raise FileNotFoundError(f"Database file not found at {DATABASE_PATH}")
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+@part2.get("/api/v1/students")
+def list_students():
+    """Return all students for the Node gateway without exposing DB access there."""
+    conn = None
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            """
+            SELECT st.id, st.user_id, st.group_id, st.stud_number, st.surname,
+                   st.first_name, st.middle_initial, st.email, st.temp_password,
+                   st.is_first_login, st.created_at,
+                   g.group_number, g.group_name,
+                   s.id AS section_id, s.name AS section_name
+            FROM students st
+            JOIN groups g ON g.id = st.group_id
+            JOIN sections s ON s.id = g.section_id
+            ORDER BY s.created_at DESC, g.group_number ASC, st.surname ASC, st.first_name ASC
+            """
+        ).fetchall()
+        return jsonify({"success": True, "students": [dict(r) for r in rows]}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@part2.get("/api/v1/records/by-stud-id/<stud_id>")
+def list_records_by_stud_id(stud_id: str):
+    """Return records for the legacy stud_id string used by the Node app."""
+    conn = None
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM record
+            WHERE stud_id = ?
+            ORDER BY date DESC, created_at DESC
+            """,
+            (stud_id,)
+        ).fetchall()
+        return jsonify({"success": True, "records": [dict(r) for r in rows]}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def normalize_text(value: object) -> str:
@@ -247,12 +295,12 @@ def import_csv(section_id: int):
                     """
                     INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email,
                                        password, is_first_login)
-                    VALUES (0, ?, ?, ?, ?, ?, ?, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (stud_number, first_name, surname, full_name_val, email, hashed)
+                    (False, stud_number, first_name, surname, full_name_val, email, hashed, True)
                 )
                 user_id = user_cur.lastrowid
-                is_first_login = 1
+                is_first_login = True
 
             conn.execute(
                 """
@@ -312,11 +360,13 @@ def get_group(group_id: int):
 
         members = conn.execute(
             """
-            SELECT id, stud_number, surname, first_name, middle_initial,
-                   email, temp_password, is_first_login
-            FROM students
-            WHERE group_id = ?
-            ORDER BY surname, first_name
+            SELECT st.id, st.stud_number, st.surname, st.first_name, st.middle_initial,
+                   st.email, st.temp_password, st.is_first_login,
+                   u.profile_pic AS profile_pic
+            FROM students st
+            LEFT JOIN users u ON u.id = st.user_id
+            WHERE st.group_id = ?
+            ORDER BY st.surname, st.first_name
             """,
             (group_id,)
         ).fetchall()
@@ -430,8 +480,8 @@ def add_student_to_group(group_id: int):
             full_name = f"{first_name} {mi_dot}{surname}".strip()
 
             user_cur = conn.execute(
-                "INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email, password, is_first_login) VALUES (0,?,?,?,?,?,?,1)",
-                (stud_number, first_name, surname, full_name, email, hashed)
+                "INSERT INTO users (is_teacher, stud_id, first_name, last_name, full_name, email, password, is_first_login) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (False, stud_number, first_name, surname, full_name, email, hashed, True)
             )
             user_id = user_cur.lastrowid
             is_first_login = 1
@@ -478,10 +528,12 @@ def get_student(student_id: int):
         student = conn.execute(
             """
             SELECT st.*, g.group_number, g.group_name,
-                   s.name AS section_name, s.id AS section_id
+                   s.name AS section_name, s.id AS section_id,
+                   u.profile_pic AS profile_pic
             FROM students st
             JOIN groups g ON g.id = st.group_id
             JOIN sections s ON s.id = g.section_id
+            LEFT JOIN users u ON u.id = st.user_id
             WHERE st.id = ?
             """,
             (student_id,)
@@ -730,7 +782,7 @@ def student_set_password():
     try:
         conn = get_connection()
         student = conn.execute(
-            "SELECT id FROM students WHERE LOWER(email) = LOWER(?) AND is_first_login = 1",
+            "SELECT id FROM students WHERE LOWER(email) = LOWER(?) AND is_first_login = TRUE",
             (email,)
         ).fetchone()
 
@@ -741,13 +793,13 @@ def student_set_password():
 
         # Update students table
         conn.execute(
-            "UPDATE students SET temp_password = NULL, is_first_login = 0 WHERE LOWER(email) = LOWER(?)",
+            "UPDATE students SET temp_password = NULL, is_first_login = FALSE WHERE LOWER(email) = LOWER(?)",
             (email,)
         )
 
         # Update users table (the auth account)
         conn.execute(
-            "UPDATE users SET password = ?, is_first_login = 0 WHERE LOWER(email) = LOWER(?)",
+            "UPDATE users SET password = ?, is_first_login = FALSE WHERE LOWER(email) = LOWER(?)",
             (hashed, email)
         )
 
@@ -939,11 +991,13 @@ def get_user_student_dashboard(user_id: int):
             """
             SELECT st.*, g.group_number, g.group_name,
                    s.name AS section_name, s.id AS section_id,
-                   t.full_name AS teacher_name
+                   t.full_name AS teacher_name,
+                   u.profile_pic AS profile_pic
             FROM students st
             JOIN groups g ON g.id = st.group_id
             JOIN sections s ON s.id = g.section_id
             JOIN users t ON t.id = s.teacher_id
+            LEFT JOIN users u ON u.id = st.user_id
             WHERE st.id = ?
             """,
             (target_student_id,)

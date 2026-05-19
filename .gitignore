@@ -1,6 +1,58 @@
+# ── Secrets & environment ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+*.manifest
+*.spec
+
+# ── Virtual environments ─────────────────────────────────────────────────────
 venv/
 env/
-.env
-*.pyc
-.pytest_cache/
+.venv/
+ENV/
+
+# ── Databases (local SQLite fallback; production uses Neon) ─────────────────────
+*.sqlite
+*.sqlite3
+*.db
+cppstudrecord_db.sqlite
+
+# ── Logs & runtime ─────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── IDE / editor ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ─────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Cursor / agent tooling (local only) ────────────────────────────────────────
+.agents/skills/
+skills-lock.json
