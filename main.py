@@ -9,7 +9,6 @@ from pathlib import Path
 import bcrypt
 from flask import Flask, jsonify, request
 
-
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR.parent / "cpp-backend" / "cppstudrecord_db.sqlite"
 
@@ -44,6 +43,15 @@ def normalize_int(value: object) -> int | None:
         return int(text)
     except (TypeError, ValueError):
         return None
+
+
+def enforce_max_length(value: object, max_length: int) -> str:
+    text = normalize_text(value)
+    return text[:max_length]
+
+
+def is_plv_email(value: object) -> bool:
+    return normalize_text(value).lower().endswith('@plv.edu.ph')
 
 
 def hash_password(password: str) -> str:
@@ -502,15 +510,22 @@ def update_profile():
         return jsonify({"success": False, "error": "User ID required"}), 401
 
     payload = get_payload()
-    first_name = normalize_text(payload.get("first_name"))
-    last_name = normalize_text(payload.get("last_name"))
+    first_name = enforce_max_length(payload.get("first_name"), 25)
+    last_name = enforce_max_length(payload.get("last_name"), 20)
+    email = enforce_max_length(payload.get("email") or "", 50)
 
     if not first_name or not last_name:
         return jsonify({"success": False, "error": "First name and last name are required"}), 400
 
+    if email and not is_plv_email(email):
+        return jsonify({"success": False, "error": "Email must end with @plv.edu.ph"}), 400
+
     try:
         connection = get_connection()
-        connection.execute("UPDATE users SET first_name = ?, last_name = ? WHERE id = ?", (first_name, last_name, user_id))
+        connection.execute(
+            "UPDATE users SET first_name = ?, last_name = ?, email = ? WHERE id = ?",
+            (first_name, last_name, email or None, user_id),
+        )
         connection.commit()
 
         user = connection.execute("SELECT id, stud_id, first_name, last_name, email, is_teacher, profile_pic FROM users WHERE id = ?", (user_id,)).fetchone()
