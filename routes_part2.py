@@ -83,6 +83,16 @@ def normalize_text(value: object) -> str:
     return str(value or "").strip()
 
 
+def is_first_login_flag(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "t", "yes", "on")
+
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -695,7 +705,7 @@ def student_request_temp():
         if not student:
             return jsonify({"success": False, "error": "Email not found in our records. Please contact your teacher to ensure you are registered."}), 404
 
-        if not student["is_first_login"]:
+        if not is_first_login_flag(student["is_first_login"]):
             return jsonify({"success": False, "error": "Account already activated. Please log in normally."}), 400
 
         if not student["temp_password"]:
@@ -743,10 +753,11 @@ def student_verify_temp():
             (email,)
         ).fetchone()
 
-        if not student or not student["is_first_login"]:
+        if not student or not is_first_login_flag(student["is_first_login"]):
             return jsonify({"success": False, "error": "Invalid email or account already activated."}), 401
 
-        if student["temp_password"] != temp_pw:
+        stored_code = normalize_text(student["temp_password"]).upper()
+        if stored_code != temp_pw.upper():
             return jsonify({"success": False, "error": "Incorrect temporary password."}), 401
 
         return jsonify({
@@ -815,11 +826,17 @@ def student_set_password():
             FROM students st
             JOIN groups g ON g.id = st.group_id
             JOIN sections s ON s.id = g.section_id
-            JOIN users u ON u.email = st.email
+            JOIN users u ON LOWER(u.email) = LOWER(st.email)
             WHERE st.id = ?
             """,
             (student["id"],)
         ).fetchone()
+
+        if not full or not full.get("user_id"):
+            return jsonify({
+                "success": False,
+                "error": "Account updated but login session could not be created. Contact your teacher.",
+            }), 500
 
         return jsonify({
             "success": True,
@@ -869,10 +886,16 @@ def student_login():
         if not student:
             return jsonify({"success": False, "error": "Invalid email or password"}), 401
 
-        if student["is_first_login"]:
+        if is_first_login_flag(student["is_first_login"]):
             return jsonify({"success": False, "error": "Account not yet activated. Please use the temporary code to set your password first."}), 403
 
-        if not bcrypt.checkpw(password.encode("utf-8"), student["hashed_password"].encode("utf-8")):
+        hashed_password = student["hashed_password"]
+        if isinstance(hashed_password, str):
+            hashed_password = hashed_password.encode("utf-8")
+        elif hashed_password is not None and not isinstance(hashed_password, bytes):
+            hashed_password = str(hashed_password).encode("utf-8")
+
+        if not hashed_password or not bcrypt.checkpw(password.encode("utf-8"), hashed_password):
             return jsonify({"success": False, "error": "Invalid email or password"}), 401
 
         response_data = {
